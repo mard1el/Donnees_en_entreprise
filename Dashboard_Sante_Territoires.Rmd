@@ -98,6 +98,14 @@ etalab_map <- etalab_raw |>
 etab <- etab_raw |>
   filter(!is.na(rs), rs != "")
 
+etab_for_analysis <- etab |>
+  mutate(
+    rs_norm_clean = rs |>
+      normalize_token() |>
+      str_replace_all("[^[:alnum:] ]", " ") |>
+      str_squish()
+  )
+
 etab_meta <- etab |>
   select(nofinesset, departement, libdepartement)
 
@@ -147,6 +155,97 @@ bigrams <- etab_text |>
   ) |>
   anti_join(stop_all |> rename(w1 = token_norm), by = "w1") |>
   anti_join(stop_all |> rename(w2 = token_norm), by = "w2")
+
+dep_tfidf <- tokens |>
+  count(departement, token_norm, name = "n") |>
+  bind_tf_idf(token_norm, departement, n) |>
+  arrange(desc(tf_idf))
+
+equipment_counts <- materiels |>
+  mutate(libeml_norm = normalize_token(coalesce(libeml, ""))) |>
+  filter(libeml_norm != "") |>
+  count(nofinesset, name = "n_eml_etab")
+
+target_terms <- tibble::tribble(
+  ~term, ~pattern,
+  "Polyvalent", "\\bpolyvalent\\b",
+  "Clinique", "\\bclinique\\b",
+  "Centre de sante", "\\bcentre\\s+de\\s+sante\\b",
+  "Radiologie", "\\bradiologie\\b"
+)
+
+term_equipment_long <- etab_for_analysis |>
+  select(nofinesset, departement, libdepartement, rs_norm_clean) |>
+  left_join(equipment_counts, by = "nofinesset") |>
+  mutate(n_eml_etab = replace_na(n_eml_etab, 0L)) |>
+  tidyr::crossing(target_terms) |>
+  mutate(term_present = str_detect(rs_norm_clean, pattern)) |>
+  select(-pattern)
+
+term_equipment_corr <- term_equipment_long |>
+  filter(term_present) |>
+  group_by(term) |>
+  summarise(
+    n_etab_avec_terme = n_distinct(nofinesset),
+    equipements_total = sum(n_eml_etab),
+    equipements_moyen = mean(n_eml_etab),
+    .groups = "drop"
+  )
+
+innovation_pattern <- "\\b(telemedecine|numerique|innovation|expertise|digital|esante|connecte|connectee)\\b"
+
+etab_innovation <- etab_for_analysis |>
+  select(nofinesset, departement, libdepartement, rs_norm_clean) |>
+  left_join(etalab_map |> distinct(nofinesset, etalab), by = "nofinesset") |>
+  mutate(
+    has_etalab_link = !is.na(etalab) & etalab != "",
+    has_innovation_name = str_detect(rs_norm_clean, innovation_pattern),
+    innovation_hub = has_etalab_link & has_innovation_name
+  )
+
+dep_innovation <- etab_innovation |>
+  group_by(departement) |>
+  summarise(
+    n_etab_innov = n(),
+    n_nom_innov = sum(has_innovation_name, na.rm = TRUE),
+    n_etalab = sum(has_etalab_link, na.rm = TRUE),
+    n_hubs = sum(innovation_hub, na.rm = TRUE),
+    hubs_per_100 = if_else(n_etab_innov > 0, 100 * n_hubs / n_etab_innov, 0),
+    part_nom_innov = if_else(n_etab_innov > 0, 100 * n_nom_innov / n_etab_innov, 0),
+    .groups = "drop"
+  )
+
+etab_token_profile <- tokens |>
+  group_by(nofinesset, departement) |>
+  summarise(
+    n_tokens = n(),
+    n_tokens_uniques = n_distinct(token_norm),
+    .groups = "drop"
+  )
+
+dep_semantic <- tokens |>
+  count(departement, token_norm, name = "n") |>
+  group_by(departement) |>
+  summarise(
+    score_diversite_sem = -sum((n / sum(n)) * log(n / sum(n))),
+    n_mots_cles_uniques = n_distinct(token_norm),
+    .groups = "drop"
+  )
+
+dep_diversity_scatter <- etab_meta |>
+  count(departement, name = "n_etab_total") |>
+  left_join(
+    etab_token_profile |>
+      group_by(departement) |>
+      summarise(mots_uniques_par_etab = mean(n_tokens_uniques), .groups = "drop"),
+    by = "departement"
+  ) |>
+  left_join(dep_semantic, by = "departement") |>
+  mutate(
+    mots_uniques_par_etab = replace_na(mots_uniques_par_etab, 0),
+    score_diversite_sem = replace_na(score_diversite_sem, 0),
+    n_mots_cles_uniques = replace_na(n_mots_cles_uniques, 0)
+  )
 
 top_themes_dep <- tokens |>
   count(departement, token_norm, sort = TRUE, name = "n") |>
@@ -229,6 +328,8 @@ dep_geo <- sf::st_read("Data/departements.geojson", quiet = TRUE) |>
   ) |>
   st_transform(4326) |>
   left_join(dep_stats, by = "departement") |>
+  left_join(dep_innovation, by = "departement") |>
+  left_join(dep_semantic, by = "departement") |>
   mutate(
     n_etab = replace_na(n_etab, 0L),
     n_act = replace_na(n_act, 0L),
@@ -241,8 +342,31 @@ dep_geo <- sf::st_read("Data/departements.geojson", quiet = TRUE) |>
     n_de_per_100 = replace_na(n_de_per_100, 0),
     n_eml_per_100 = replace_na(n_eml_per_100, 0),
     score_acces = replace_na(score_acces, 0),
+    n_etab_innov = replace_na(n_etab_innov, 0L),
+    n_nom_innov = replace_na(n_nom_innov, 0L),
+    n_etalab = replace_na(n_etalab, 0L),
+    n_hubs = replace_na(n_hubs, 0L),
+    hubs_per_100 = replace_na(hubs_per_100, 0),
+    part_nom_innov = replace_na(part_nom_innov, 0),
+    score_diversite_sem = replace_na(score_diversite_sem, 0),
+    n_mots_cles_uniques = replace_na(n_mots_cles_uniques, 0L),
     top_themes = replace_na(top_themes, "Pas de themes detectes"),
     libdepartement = coalesce(libdepartement_geo, departement)
+  )
+
+dep_diversity_scatter <- dep_diversity_scatter |>
+  left_join(
+    dep_geo |>
+      st_drop_geometry() |>
+      select(departement, libdepartement) |>
+      distinct(),
+    by = "departement"
+  ) |>
+  mutate(
+    seuil_bas_etab = quantile(n_etab_total[n_etab_total > 0], probs = 0.35, na.rm = TRUE),
+    seuil_haut_div = quantile(mots_uniques_par_etab, probs = 0.75, na.rm = TRUE),
+    flag_aberrant = n_etab_total <= seuil_bas_etab & mots_uniques_par_etab >= seuil_haut_div,
+    profil = if_else(flag_aberrant, "Peu d'etablissements / forte diversite", "Profil standard")
   )
 
 annexes_datasets <- tibble::tribble(
@@ -261,7 +385,9 @@ map_metric_choices <- c(
   "Activites de soin pour 100 etablissements" = "n_act_per_100",
   "Disciplines pour 100 etablissements" = "n_de_per_100",
   "Materiels lourds pour 100 etablissements" = "n_eml_per_100",
-  "Indice composite d'acces (0-100)" = "score_acces"
+  "Indice composite d'acces (0-100)" = "score_acces",
+  "Poles innovation pour 100 etablissements" = "hubs_per_100",
+  "Score de diversite semantique (entropie)" = "score_diversite_sem"
 )
 
 dep_choices_tbl <- dep_geo |>
@@ -388,12 +514,10 @@ renderValueBox({
 })
 ```
 
-Column
+Column {.tabset}
 -----------------------------------------------------------------------
 
-### Analyses textuelles {.tabset}
-
-#### Nuage de mots
+### Nuage de mots
 
 ```{r}
 renderWordcloud2({
@@ -423,7 +547,7 @@ renderWordcloud2({
 })
 ```
 
-#### Bigrammes
+### Bigrammes
 
 ```{r}
 renderPlotly({
@@ -452,7 +576,7 @@ renderPlotly({
 })
 ```
 
-#### Table des termes
+### Table des termes
 
 ```{r}
 renderDT({
@@ -473,6 +597,32 @@ renderDT({
       options = list(pageLength = 12, dom = "tip"),
       colnames = c("terme", "frequence")
     )
+})
+```
+
+### TF-IDF departemental
+
+```{r}
+renderPlotly({
+  top_n <- max(1L, as.integer(input$top_n %||% 30L))
+
+  validate(need(input$dep_select_explo != "Tous", "Selectionne un departement pour visualiser les termes specifiques (TF-IDF)."))
+
+  df <- dep_tfidf |>
+    filter(departement == input$dep_select_explo) |>
+    slice_max(order_by = tf_idf, n = top_n, with_ties = FALSE) |>
+    arrange(tf_idf) |>
+    mutate(token_norm = forcats::fct_reorder(token_norm, tf_idf))
+
+  validate(need(nrow(df) > 0, "Aucun terme TF-IDF disponible pour ce departement."))
+
+  p <- ggplot(df, aes(x = token_norm, y = tf_idf)) +
+    geom_col(fill = "#6a4c93") +
+    coord_flip() +
+    labs(x = NULL, y = "TF-IDF", title = "Termes les plus specifiques du departement") +
+    theme_minimal(base_size = 12)
+
+  ggplotly(p, tooltip = c("x", "y"))
 })
 ```
 
@@ -506,12 +656,10 @@ HTML(
 )
 ```
 
-Column
+Column {.tabset}
 -----------------------------------------------------------------------
 
-### Analyses territoriales {.tabset}
-
-#### Carte departementale
+### Carte departementale
 
 ```{r}
 renderLeaflet({
@@ -569,7 +717,7 @@ renderLeaflet({
 })
 ```
 
-#### Profil territorial
+### Profil territorial
 
 ```{r}
 renderPlotly({
@@ -617,7 +765,7 @@ renderPlotly({
 })
 ```
 
-#### Comparaison multi-indicateurs
+### Comparaison multi-indicateurs
 
 ```{r}
 renderPlotly({
@@ -656,7 +804,7 @@ renderPlotly({
 })
 ```
 
-#### Classement de l'indicateur choisi
+### Classement de l'indicateur choisi
 
 ```{r}
 renderPlotly({
@@ -689,14 +837,218 @@ renderPlotly({
 })
 ```
 
-# Annexes
+# Analyses avancees
 
-Column
+Column {.sidebar data-width=320}
 -----------------------------------------------------------------------
 
-### Documentation {.tabset}
+### Filtres des axes avances
 
-#### Jeux de donnees
+```{r}
+selectInput(
+  inputId = "dep_select_axes",
+  label = "Selection du departement",
+  choices = dep_choices,
+  selected = "Tous",
+  selectize = TRUE
+)
+
+HTML(
+  "<b>Objectif :</b> relier semantique, equipement, maturite numerique et diversite territoriale.<br>
+  Le filtre departement applique une lecture locale des trois axes." 
+)
+```
+
+Column {.tabset}
+-----------------------------------------------------------------------
+
+### Equipement vs specialisation
+
+```{r}
+renderPlotly({
+  d <- if (input$dep_select_axes == "Tous") {
+    term_equipment_long
+  } else {
+    term_equipment_long |> filter(departement == input$dep_select_axes)
+  }
+
+  df <- d |>
+    group_by(term, term_present) |>
+    summarise(
+      equipements_moyens = mean(n_eml_etab),
+      n_etablissements = n_distinct(nofinesset),
+      .groups = "drop"
+    ) |>
+    mutate(presence = if_else(term_present, "Terme present", "Terme absent"))
+
+  validate(need(nrow(df) > 0, "Aucune donnee pour cette selection."))
+
+  p <- ggplot(df, aes(x = term, y = equipements_moyens, fill = presence)) +
+    geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+    labs(
+      x = NULL,
+      y = "Nombre moyen de materiels lourds",
+      fill = NULL,
+      title = "Presence d'un terme dans le nom vs equipements declares"
+    ) +
+    theme_minimal(base_size = 12)
+
+  ggplotly(p, tooltip = c("x", "y", "fill"))
+})
+```
+
+### Correlation terme-equipement
+
+```{r}
+renderPlotly({
+  d <- if (input$dep_select_axes == "Tous") {
+    term_equipment_long
+  } else {
+    term_equipment_long |> filter(departement == input$dep_select_axes)
+  }
+
+  df <- d |>
+    filter(term_present) |>
+    group_by(term) |>
+    summarise(
+      n_etab_avec_terme = n_distinct(nofinesset),
+      equipements_total = sum(n_eml_etab),
+      equipements_moyen = mean(n_eml_etab),
+      .groups = "drop"
+    )
+
+  validate(need(nrow(df) > 0, "Aucune correlation calculable pour cette selection."))
+
+  p <- ggplot(
+    df,
+    aes(
+      x = n_etab_avec_terme,
+      y = equipements_total,
+      size = equipements_moyen,
+      label = term,
+      text = paste0(
+        term,
+        "<br>Etablissements avec le terme: ", n_etab_avec_terme,
+        "<br>Equipements totaux: ", equipements_total,
+        "<br>Equipements moyens: ", scales::number(equipements_moyen, accuracy = 0.1)
+      )
+    )
+  ) +
+    geom_point(color = "#2a9d8f", alpha = 0.85) +
+    geom_text(vjust = -0.6, size = 3.5) +
+    scale_size_continuous(range = c(6, 18)) +
+    labs(
+      x = "Frequence des etablissements contenant le terme",
+      y = "Nombre total de materiels lourds",
+      size = "Equipements moyens",
+      title = "Correlation semantique des noms et equipements"
+    ) +
+    theme_minimal(base_size = 12)
+
+  ggplotly(p, tooltip = "text")
+})
+```
+
+### Maturite numerique (heatmap territoriale)
+
+```{r}
+renderLeaflet({
+  d <- if (input$dep_select_axes == "Tous") {
+    dep_geo
+  } else {
+    dep_geo |> filter(departement == input$dep_select_axes)
+  }
+
+  validate(need(nrow(d) > 0, "Aucune geometrie disponible pour cette selection."))
+
+  pal <- colorNumeric(
+    palette = "YlOrRd",
+    domain = dep_geo$hubs_per_100,
+    na.color = "#f0f0f0"
+  )
+
+  leaflet(d) |>
+    addProviderTiles(providers$CartoDB.Positron) |>
+    addPolygons(
+      fillColor = ~pal(hubs_per_100),
+      weight = 1,
+      color = "#4f5d75",
+      opacity = 1,
+      fillOpacity = 0.8,
+      smoothFactor = 0.2,
+      label = ~paste0(
+        departement, " - ", libdepartement,
+        " | Hubs innovation /100 etab : ", scales::number(hubs_per_100, accuracy = 0.1)
+      ),
+      popup = ~paste0(
+        "<b>", departement, " - ", libdepartement, "</b><br>",
+        "Etablissements: ", format(n_etab, big.mark = " "), "<br>",
+        "Noms a connotation innovation: ", format(n_nom_innov, big.mark = " "), "<br>",
+        "Lies Etalab: ", format(n_etalab, big.mark = " "), "<br>",
+        "Poles innovation (nom + mapping): ", format(n_hubs, big.mark = " "), "<br>",
+        "Poles innovation /100 etab: ", scales::number(hubs_per_100, accuracy = 0.1)
+      )
+    ) |>
+    addLegend(
+      "bottomright",
+      pal = pal,
+      values = dep_geo$hubs_per_100,
+      title = "Hubs innovation /100 etab",
+      opacity = 0.85
+    )
+})
+```
+
+### Deserts et diversite semantique
+
+```{r}
+renderPlotly({
+  df <- dep_diversity_scatter
+
+  df <- if (input$dep_select_axes == "Tous") {
+    df
+  } else {
+    df |>
+      mutate(profil = if_else(departement == input$dep_select_axes, "Departement selectionne", profil))
+  }
+
+  p <- ggplot(
+    df,
+    aes(
+      x = n_etab_total,
+      y = mots_uniques_par_etab,
+      size = score_diversite_sem,
+      color = profil,
+      text = paste0(
+        departement, " - ", libdepartement,
+        "<br>Etablissements: ", format(n_etab_total, big.mark = " "),
+        "<br>Mots-cles uniques / etab: ", scales::number(mots_uniques_par_etab, accuracy = 0.1),
+        "<br>Score de diversite (entropie): ", scales::number(score_diversite_sem, accuracy = 0.01),
+        "<br>Mots-cles uniques departementaux: ", format(n_mots_cles_uniques, big.mark = " ")
+      )
+    )
+  ) +
+    geom_point(alpha = 0.85) +
+    scale_size_continuous(range = c(4, 15)) +
+    labs(
+      x = "Nombre total d'etablissements",
+      y = "Nombre moyen de mots-cles uniques par etablissement",
+      size = "Entropie semantique",
+      color = NULL,
+      title = "Diversite de l'offre semantique et potentiels deserts thematiques"
+    ) +
+    theme_minimal(base_size = 12)
+
+  ggplotly(p, tooltip = "text")
+})
+```
+
+# Annexes
+
+Column {.tabset}
+-----------------------------------------------------------------------
+
+### Jeux de donnees
 
 ```{r}
 renderDT({
@@ -712,7 +1064,7 @@ renderDT({
 })
 ```
 
-#### Couverture des sources
+### Couverture des sources
 
 ```{r}
 renderPlotly({
@@ -730,7 +1082,7 @@ renderPlotly({
 })
 ```
 
-#### Methodologie
+### Methodologie
 
 ```{r}
 HTML(
