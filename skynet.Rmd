@@ -113,17 +113,23 @@ theme_finess <- function(base_size = 12) {
 
 # ── 3. Fonctions utilitaires de lecture ──────────────────────────────────────
 
-#' Lire un fichier CSV au format FINESS (séparateur ";", encodage Latin-1)
+#' Lire un fichier CSV FINESS (séparateur ";") avec détection d'encodage
 #'
 #' @param path Chemin vers le fichier CSV
 #' @return Un tibble avec toutes les colonnes
 read_finess_csv <- function(path) {
+  guessed <- readr::guess_encoding(path, n_max = 20000)
+  enc <- guessed |>
+    dplyr::slice_head(n = 1) |>
+    dplyr::pull(encoding)
+  if (length(enc) == 0 || is.na(enc) || enc == "") enc <- "UTF-8"
+
   readr::read_delim(
     file         = path,
     delim        = ";",
     col_types    = readr::cols(.default = readr::col_character()),
     trim_ws      = TRUE,
-    locale       = readr::locale(encoding = "Latin1"),
+    locale       = readr::locale(encoding = enc),
     show_col_types = FALSE,
     progress     = FALSE
   )
@@ -136,6 +142,7 @@ read_finess_csv <- function(path) {
 #' @return Vecteur normalisé
 normalize_text <- function(x) {
   x |>
+    enc2utf8() |>
     stringi::stri_trans_general("Latin-ASCII") |>
     stringr::str_to_lower()
 }
@@ -319,8 +326,8 @@ dep_geo <- sf::st_read(
 
 
 # ── 8. Analyse textuelle ─────────────────────────────────────────────────────
-# On analyse les noms d'établissements (rset) présents dans les activités.
-# Étapes : nettoyage → tokenisation → suppression stop-words → TF-IDF
+# Pipeline robuste aligné avec la logique validée du dashboard de référence.
+# Étapes : normalisation UTF-8, nettoyage, tokenisation, stop-words, TF-IDF.
 
 # 8a. Corpus des noms d'établissements uniques par département
 corpus_etab <- activites_clean |>
@@ -328,28 +335,29 @@ corpus_etab <- activites_clean |>
   distinct(nofinesset, .keep_all = TRUE) |>
   filter(!is.na(rset), rset != "") |>
   mutate(
-    # Nettoyage : apostrophes, caractères spéciaux, espaces multiples
-    text_clean = rset |>
-      str_replace_all("['']", " ") |>
-      str_replace_all("[^[:alnum:] ]", " ") |>
-      str_squish()
+    rset_utf8  = enc2utf8(rset),
+    text_clean = rset_utf8 |>
+      stringr::str_replace_all("['’]", " ") |>
+      stringr::str_replace_all("[^[:alnum:] ]", " ") |>
+      stringr::str_squish()
   )
 
-# 8b. Stop-words : liste française standard + termes métier peu discriminants
+# 8b. Stop-words : français standard + termes métier peu discriminants
 stop_fr <- tibble(
   word_norm = normalize_text(stopwords::stopwords("fr", source = "snowball"))
 )
 stop_metier <- tibble(
   word_norm = c(
-    "centre","centres","etablissement","etablissements","site","sites",
-    "hopital","hospitalier","hospitaliere","hospitaliers","hospitalieres",
-    "clinique","cliniques","groupement","pole","poles","service","services",
-    "unite","unites","maison","sante","institut","association","residence",
-    "foyer","chu","chru","chr","ssr","ehpad","de","du","des","d","l",
-    "le","la","les","aux","sur","chez","en","au","les","et","ou"
+    "centre", "centres", "etablissement", "etablissements", "site", "sites",
+    "hopital", "hospitalier", "hospitaliere", "hospitaliers", "hospitalieres",
+    "clinique", "cliniques", "groupement", "pole", "poles", "service", "services",
+    "unite", "unites", "maison", "sante", "institut", "association", "residence",
+    "foyer", "chu", "chru", "chr", "ssr", "ehpad", "de", "du", "des", "d", "l",
+    "le", "la", "les", "aux", "sur", "chez", "en", "au", "et", "ou"
   )
 )
-stop_all <- bind_rows(stop_fr, stop_metier) |> distinct()
+stop_all <- bind_rows(stop_fr, stop_metier) |>
+  distinct()
 
 # 8c. Tokenisation : un token = un mot du nom d'établissement
 tokens_etab <- corpus_etab |>
@@ -360,8 +368,8 @@ tokens_etab <- corpus_etab |>
   ) |>
   mutate(word_norm = normalize_text(word)) |>
   filter(
-    str_detect(word_norm, "[a-z]"),
-    str_length(word_norm) > 2
+    stringr::str_detect(word_norm, "[a-z]"),
+    stringr::str_length(word_norm) > 2
   ) |>
   anti_join(stop_all, by = "word_norm")
 
@@ -373,30 +381,31 @@ bigrams_etab <- corpus_etab |>
     token  = "ngrams", n = 2
   ) |>
   tidyr::separate(bigram, into = c("w1", "w2"), sep = " ", remove = FALSE) |>
-  mutate(w1 = normalize_text(w1), w2 = normalize_text(w2)) |>
+  mutate(
+    w1 = normalize_text(w1),
+    w2 = normalize_text(w2)
+  ) |>
   filter(
     !is.na(w1), !is.na(w2),
-    str_detect(w1, "[a-z]"), str_detect(w2, "[a-z]"),
-    str_length(w1) > 2, str_length(w2) > 2
+    stringr::str_detect(w1, "[a-z]"), stringr::str_detect(w2, "[a-z]"),
+    stringr::str_length(w1) > 2, stringr::str_length(w2) > 2
   ) |>
   anti_join(stop_all |> rename(w1 = word_norm), by = "w1") |>
   anti_join(stop_all |> rename(w2 = word_norm), by = "w2") |>
   mutate(bigram = paste(w1, w2))
 
-# 8e. TF-IDF par département : identifie les termes spécifiques à chaque département
-# (fréquents localement mais rares nationalement)
+# 8e. TF-IDF par département : termes fréquents localement et rares nationalement
 tfidf_dep <- tokens_etab |>
   count(dep, word_norm, name = "n") |>
   tidytext::bind_tf_idf(word_norm, dep, n)
 
 # 8f. Diversité sémantique départementale (entropie de Shannon)
-# Plus l'entropie est haute, plus le département a une offre thématiquement variée
 div_semantique <- tokens_etab |>
   count(dep, word_norm, name = "n") |>
   group_by(dep) |>
   summarise(
-    entropie        = -sum((n / sum(n)) * log2(n / sum(n))),
-    n_termes_uniq   = n_distinct(word_norm),
+    entropie      = -sum((n / sum(n)) * log2(n / sum(n))),
+    n_termes_uniq = n_distinct(word_norm),
     .groups = "drop"
   )
 
@@ -1191,25 +1200,28 @@ Column {.tabset}
 # La taille de chaque mot est proportionnelle à sa fréquence.
 renderWordcloud2({
   top_n <- max(1L, as.integer(input$top_n_text %||% 30L))
-  dep   <- input$dep_text
+  dep <- input$dep_text
 
-  wc_data <- if (dep == "Tous") tokens_etab else tokens_etab |> filter(dep == !!dep)
+  filtered_tokens <- if (dep == "Tous") {
+    tokens_etab
+  } else {
+    tokens_etab |> filter(dep == !!dep)
+  }
 
-  wc_data <- wc_data |>
+  wc <- filtered_tokens |>
     count(word_norm, sort = TRUE) |>
     slice_head(n = top_n) |>
     rename(word = word_norm, freq = n)
 
-  validate(need(nrow(wc_data) > 0, "Aucun terme disponible."))
+  validate(need(nrow(wc) > 0, "Aucun terme disponible pour ce filtre."))
 
   wordcloud2(
-    data            = wc_data,
-    size            = 0.6,
-    minSize         = 5,
-    rotateRatio     = 0.12,
-    # Palette cohérente avec le dashboard
-    color           = rep(c("#1a3a5c","#2176ae","#00b4d8","#06a77d","#f4a261","#8896a8"), 10),
-    backgroundColor = "#ffffff"
+    data = wc,
+    size = 0.7,
+    minSize = 6,
+    rotateRatio = 0.2,
+    color = "random-dark",
+    backgroundColor = "#f7f9fb"
   )
 })
 ```
