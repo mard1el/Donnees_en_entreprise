@@ -53,7 +53,7 @@ knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
 # afin d'afficher un message d'erreur clair en cas d'absence.
 required_packages <- c(
   "flexdashboard", "shiny", "tidyverse", "tidytext", "wordcloud2",
-  "leaflet", "sf", "DT", "plotly", "stopwords", "scales",
+  "wordcloud", "leaflet", "sf", "DT", "plotly", "stopwords", "scales",
   "htmltools", "stringi", "lubridate"
 )
 
@@ -70,6 +70,7 @@ if (length(missing_pkgs) > 0) {
 
 library(flexdashboard); library(shiny);      library(tidyverse)
 library(tidytext);      library(wordcloud2); library(leaflet)
+library(wordcloud)
 library(sf);            library(DT);         library(plotly)
 library(stopwords);     library(scales);     library(htmltools)
 library(stringi);       library(lubridate)
@@ -1196,9 +1197,9 @@ Column {.tabset}
 ### ☁️ Nuage de mots
 
 ```{r p3-wordcloud}
-# Nuage de mots des termes les plus fréquents dans les noms d'établissements.
-# La taille de chaque mot est proportionnelle à sa fréquence.
-renderWordcloud2({
+# Nuage de mots statique (robuste) des termes les plus fréquents.
+# Ce rendu évite les problèmes de widgets JS parfois rencontrés avec wordcloud2.
+renderPlot({
   top_n <- max(1L, as.integer(input$top_n_text %||% 30L))
   dep <- input$dep_text
 
@@ -1210,20 +1211,22 @@ renderWordcloud2({
 
   wc <- filtered_tokens |>
     count(word_norm, sort = TRUE) |>
-    slice_head(n = top_n) |>
-    rename(word = word_norm, freq = n)
+    slice_head(n = top_n)
 
   validate(need(nrow(wc) > 0, "Aucun terme disponible pour ce filtre."))
 
-  wordcloud2(
-    data = wc,
-    size = 0.7,
-    minSize = 6,
-    rotateRatio = 0.2,
-    color = "random-dark",
-    backgroundColor = "#f7f9fb"
+  set.seed(123)
+  par(mar = c(0, 0, 0, 0), bg = "white")
+  wordcloud::wordcloud(
+    words = wc$word_norm,
+    freq = wc$n,
+    scale = c(4.2, 0.9),
+    min.freq = 1,
+    random.order = FALSE,
+    rot.per = 0.2,
+    colors = colorRampPalette(c("#1a3a5c", "#2176ae", "#00b4d8", "#06a77d", "#f4a261"))(max(8, nrow(wc)))
   )
-})
+}, res = 96)
 ```
 
 ### 📊 Fréquence des termes
