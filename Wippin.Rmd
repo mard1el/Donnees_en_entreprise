@@ -1,0 +1,465 @@
+---
+title: "Dashboard Santé et Territoires"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+    theme: lumen
+runtime: shiny
+---
+
+```{r global, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+# 1. Chargement des packages
+required_packages <- c(
+  "flexdashboard", "shiny", "tidyverse", "tidytext", "wordcloud2", "leaflet",
+  "sf", "DT", "plotly", "stopwords", "scales", "htmltools", "stringi"
+)
+
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages) > 0) {
+  stop(paste0("Packages manquants: ", paste(missing_packages, collapse = ", "), ". Installe-les avec install.packages()."))
+}
+
+invisible(lapply(required_packages, library, character.only = TRUE))
+
+# 2. Fonctions de lecture
+read_finess <- function(path) {
+  readr::read_delim(
+    file = path, delim = ";", col_types = readr::cols(.default = readr::col_character()),
+    trim_ws = TRUE, locale = readr::locale(encoding = "Latin1"), show_col_types = FALSE, progress = FALSE
+  )
+}
+
+read_etalab_mapping <- function(path) {
+  readr::read_delim(
+    file = path, delim = ";", col_names = c("type_lien", "finess", "etalab", "meta"),
+    col_types = readr::cols(.default = readr::col_character()), trim_ws = TRUE,
+    locale = readr::locale(encoding = "Latin1"), show_col_types = FALSE, progress = FALSE
+  )
+}
+
+normalize_token <- function(x) {
+  x |> stringi::stri_trans_general("Latin-ASCII") |> stringr::str_to_lower()
+}
+
+# 3. Importation des données
+etab_raw <- read_finess("Data/finess_etablissements.csv") |>
+  transmute(
+    nofinesset, rs, rslongue,
+    departement = coalesce(na_if(departement, ""), "NC"),
+    libdepartement = coalesce(na_if(libdepartement, ""), "Non renseigne"),
+    coordxet = readr::parse_double(coordxet, locale = readr::locale(decimal_mark = ".")),
+    coordyet = readr::parse_double(coordyet, locale = readr::locale(decimal_mark = "."))
+  )
+
+activites <- read_finess("Data/finess_activites_soin.csv") |> transmute(nofinesset, libactivite)
+disciplines <- read_finess("Data/finess_disciplines_enseignement.csv") |> transmute(nofinesset, libde)
+materiels <- read_finess("Data/finess_materiels_lourds.csv") |> transmute(nofinesset, libeml)
+
+etalab_raw <- read_etalab_mapping("Data/etalab-cs1100505-stock-20260311-0344.csv")
+etalab_map <- etalab_raw |> filter(type_lien == "structureet") |> transmute(nofinesset = finess, etalab)
+
+etab <- etab_raw |> filter(!is.na(rs), rs != "")
+
+etab_for_analysis <- etab |>
+  mutate(rs_norm_clean = str_squish(str_replace_all(normalize_token(rs), "[^[:alnum:] ]", " ")))
+
+etab_meta <- etab |> select(nofinesset, departement, libdepartement)
+
+# 4. Stop words enrichis
+stop_fr <- tibble(token_norm = normalize_token(stopwords::stopwords("fr", source = "snowball")))
+stop_custom <- tibble(
+  token_norm = c(
+    "centre", "centres", "etablissement", "etablissements", "site", "hopital",
+    "hospitalier", "hospitaliere", "hospitalieres", "hospitaliers", "clinique",
+    "groupement", "pole", "poles", "service", "services", "unite", "unites",
+    "maison", "sante", "institut", "association", "residence", "foyer", "de",
+    "du", "des", "d", "l", "le", "la", "les", "aux", "sur", "chez", "en",
+    "medical", "medicale", "medico", "soins", "soin", "prive", "privee", 
+    "public", "publique", "ch", "chu", "chr", "chru", "cs"
+  )
+)
+stop_all <- bind_rows(stop_fr, stop_custom) |> distinct()
+
+etab_text <- etab |>
+  mutate(text_clean = str_replace_all(str_replace_all(rs, "['’]", " "), "[^[:alnum:] ]", " "))
+
+tokens <- etab_text |>
+  select(nofinesset, departement, libdepartement, text_clean) |>
+  unnest_tokens(output = token, input = text_clean, token = "words") |>
+  mutate(token_norm = normalize_token(token)) |>
+  filter(str_detect(token_norm, "[a-z]"), str_length(token_norm) > 2) |>
+  anti_join(stop_all, by = "token_norm")
+
+bigrams <- etab_text |>
+  select(nofinesset, departement, libdepartement, text_clean) |>
+  unnest_tokens(output = bigram, input = text_clean, token = "ngrams", n = 2) |>
+  separate(bigram, into = c("w1", "w2"), sep = " ", remove = FALSE) |>
+  mutate(w1 = normalize_token(w1), w2 = normalize_token(w2), bigram = paste(w1, w2)) |>
+  filter(
+    !is.na(w1), !is.na(w2), str_detect(w1, "[a-z]"), str_detect(w2, "[a-z]"),
+    str_length(w1) > 2, str_length(w2) > 2
+  ) |>
+  anti_join(stop_all |> rename(w1 = token_norm), by = "w1") |>
+  anti_join(stop_all |> rename(w2 = token_norm), by = "w2")
+
+dep_tfidf <- tokens |>
+  count(departement, token_norm, name = "n") |>
+  bind_tf_idf(token_norm, departement, n) |>
+  arrange(desc(tf_idf))
+
+# 5. Analyses croisées (Equipements, Innovation, Sémantique)
+equipment_counts <- materiels |>
+  mutate(libeml_norm = normalize_token(coalesce(libeml, ""))) |>
+  filter(libeml_norm != "") |> count(nofinesset, name = "n_eml_etab")
+
+target_terms <- tibble::tribble(
+  ~term, ~pattern,
+  "Polyvalent", "\\bpolyvalent\\b",
+  "Clinique", "\\bclinique\\b",
+  "Centre de sante", "\\bcentre\\s+de\\s+sante\\b",
+  "Radiologie", "\\bradiologie\\b"
+)
+
+term_equipment_long <- etab_for_analysis |>
+  select(nofinesset, departement, libdepartement, rs_norm_clean) |>
+  left_join(equipment_counts, by = "nofinesset") |>
+  mutate(n_eml_etab = replace_na(n_eml_etab, 0L)) |>
+  tidyr::crossing(target_terms) |>
+  mutate(term_present = str_detect(rs_norm_clean, pattern)) |> select(-pattern)
+
+innovation_pattern <- "\\b(telemedecine|numerique|innovation|expertise|digital|esante|connecte|connectee)\\b"
+
+dep_innovation <- etab_for_analysis |>
+  select(nofinesset, departement, libdepartement, rs_norm_clean) |>
+  left_join(etalab_map |> distinct(nofinesset, etalab), by = "nofinesset") |>
+  mutate(
+    has_etalab_link = !is.na(etalab) & etalab != "",
+    has_innovation_name = str_detect(rs_norm_clean, innovation_pattern),
+    innovation_hub = has_etalab_link & has_innovation_name
+  ) |>
+  group_by(departement) |>
+  summarise(
+    n_etab_innov = n(),
+    n_nom_innov = sum(has_innovation_name, na.rm = TRUE),
+    n_etalab = sum(has_etalab_link, na.rm = TRUE),
+    n_hubs = sum(innovation_hub, na.rm = TRUE),
+    hubs_per_100 = if_else(n_etab_innov > 0, 100 * n_hubs / n_etab_innov, 0),
+    part_nom_innov = if_else(n_etab_innov > 0, 100 * n_nom_innov / n_etab_innov, 0),
+    .groups = "drop"
+  )
+
+dep_semantic <- tokens |>
+  count(departement, token_norm, name = "n") |>
+  group_by(departement) |>
+  summarise(
+    score_diversite_sem = -sum((n / sum(n)) * log(n / sum(n))),
+    n_mots_cles_uniques = n_distinct(token_norm),
+    .groups = "drop"
+  )
+
+etab_token_profile <- tokens |> group_by(nofinesset, departement) |> summarise(n_tokens = n(), n_tokens_uniques = n_distinct(token_norm), .groups = "drop")
+
+dep_diversity_scatter <- etab_meta |>
+  count(departement, name = "n_etab_total") |>
+  left_join(etab_token_profile |> group_by(departement) |> summarise(mots_uniques_par_etab = mean(n_tokens_uniques), .groups = "drop"), by = "departement") |>
+  left_join(dep_semantic, by = "departement") |>
+  mutate(across(c(mots_uniques_par_etab, score_diversite_sem, n_mots_cles_uniques), ~replace_na(.x, 0)))
+
+top_themes_dep <- tokens |>
+  count(departement, token_norm, sort = TRUE, name = "n") |> group_by(departement) |>
+  slice_max(order_by = n, n = 8, with_ties = FALSE) |>
+  summarise(top_themes = paste0(token_norm, " (", n, ")", collapse = ", "), .groups = "drop")
+
+# 6. Statistiques géographiques globales
+dep_stats <- etab_meta |>
+  count(departement, name = "n_etab") |>
+  left_join(activites |> left_join(etab_meta, by = "nofinesset") |> filter(!is.na(departement)) |> count(departement, name = "n_act"), by = "departement") |>
+  left_join(disciplines |> left_join(etab_meta, by = "nofinesset") |> filter(!is.na(departement)) |> count(departement, name = "n_de"), by = "departement") |>
+  left_join(materiels |> left_join(etab_meta, by = "nofinesset") |> filter(!is.na(departement)) |> count(departement, name = "n_eml"), by = "departement") |>
+  left_join(top_themes_dep, by = "departement") |>
+  mutate(
+    across(c(n_act, n_de, n_eml), ~replace_na(.x, 0L)),
+    n_act_per_100 = if_else(n_etab > 0, 100 * n_act / n_etab, 0),
+    n_de_per_100 = if_else(n_etab > 0, 100 * n_de / n_etab, 0),
+    n_eml_per_100 = if_else(n_etab > 0, 100 * n_eml / n_etab, 0),
+    score_acces = scales::rescale(0.5 * n_act_per_100 + 0.3 * n_de_per_100 + 0.2 * n_eml_per_100, to = c(0, 100)),
+    top_themes = replace_na(top_themes, "Pas de thèmes détectés")
+  )
+
+dep_geo <- sf::st_read("Data/departements.geojson", quiet = TRUE) |>
+  mutate(departement = stringr::str_to_upper(as.character(code)), libdepartement_geo = as.character(nom)) |>
+  st_transform(4326) |>
+  left_join(dep_stats, by = "departement") |> left_join(dep_innovation, by = "departement") |> left_join(dep_semantic, by = "departement") |>
+  mutate(
+    across(c(n_etab, n_act, n_de, n_eml, n_etab_innov, n_nom_innov, n_etalab, n_hubs, n_mots_cles_uniques), ~replace_na(.x, 0L)),
+    across(c(n_act_per_100, n_de_per_100, n_eml_per_100, score_acces, hubs_per_100, part_nom_innov, score_diversite_sem), ~replace_na(.x, 0)),
+    libdepartement = coalesce(libdepartement_geo, departement)
+  )
+
+dep_diversity_scatter <- dep_diversity_scatter |>
+  left_join(dep_geo |> st_drop_geometry() |> select(departement, libdepartement) |> distinct(), by = "departement") |>
+  mutate(
+    seuil_bas_etab = quantile(n_etab_total[n_etab_total > 0], probs = 0.35, na.rm = TRUE),
+    seuil_haut_div = quantile(mots_uniques_par_etab, probs = 0.75, na.rm = TRUE),
+    profil = if_else(n_etab_total <= seuil_bas_etab & mots_uniques_par_etab >= seuil_haut_div, "Peu d'établissements / forte diversité", "Profil standard")
+  )
+
+# UI Choix
+map_metric_choices <- c(
+  "Établissements (volume)" = "n_etab", "Activités de soin pour 100 établissements" = "n_act_per_100",
+  "Disciplines pour 100 établissements" = "n_de_per_100", "Matériels lourds pour 100 établissements" = "n_eml_per_100",
+  "Indice composite d'accès (0-100)" = "score_acces", "Pôles innovation pour 100 établissements" = "hubs_per_100",
+  "Score de diversité sémantique" = "score_diversite_sem"
+)
+
+dep_choices_tbl <- dep_geo |> st_drop_geometry() |> filter(n_etab > 0) |> distinct(departement, libdepartement) |> arrange(departement) |> mutate(label = paste0(departement, " - ", libdepartement))
+dep_choices <- c("Tous" = "Tous", setNames(dep_choices_tbl$departement, dep_choices_tbl$label))
+
+# Palette globale
+couleur_principale <- "#2A9D8F"
+couleur_secondaire <- "#E9C46A"
+couleur_accent <- "#E76F51"
+```
+
+```{css}
+.sidebar { overflow-y: auto; }
+.section.sidebar h3 { margin-top: 0.4em; }
+.leaflet-container { min-height: 460px; }
+.plotly html-widget, .html-widget { width: 100% !important; }
+```
+
+# Exploration NLP
+
+Column {.sidebar data-width=300}
+-----------------------------------------------------------------------
+
+### Filtres
+
+```{r}
+selectInput("dep_select_explo", "Sélection du département", choices = dep_choices, selected = "Tous", selectize = TRUE)
+sliderInput("top_n", "Nombre de termes affichés", min = 10, max = 80, value = 30, step = 5)
+```
+
+### Lecture de l'axe
+```{r}
+HTML("<b>Axe d'étude :</b> spécialisation des territoires via la sémantique des noms d'établissements.<br><b>Principe :</b> on nettoie les noms (tokenisation + stop words), puis on compare les thèmes dominants par département.")
+```
+
+### Indicateurs
+
+```{r}
+# --- CREATION DES BLOCS REACTIFS POUR OPTIMISER LES CALCULS ---
+react_explo_meta <- reactive({
+  req(input$dep_select_explo)
+  if(input$dep_select_explo == "Tous") etab_meta else filter(etab_meta, departement == input$dep_select_explo)
+})
+
+react_explo_tokens <- reactive({
+  req(input$dep_select_explo)
+  if(input$dep_select_explo == "Tous") tokens else filter(tokens, departement == input$dep_select_explo)
+})
+
+react_explo_bigrams <- reactive({
+  req(input$dep_select_explo)
+  if(input$dep_select_explo == "Tous") bigrams else filter(bigrams, departement == input$dep_select_explo)
+})
+# -------------------------------------------------------------
+
+renderValueBox({
+  valueBox(value = format(nrow(react_explo_meta()), big.mark = " "), caption = "Établissements", icon = "fa-hospital", color = "primary")
+})
+```
+
+```{r}
+renderValueBox({
+  ids <- react_explo_meta()$nofinesset
+  valueBox(value = format(activites |> filter(nofinesset %in% ids) |> nrow(), big.mark = " "), caption = "Lignes d'activités de soin", icon = "fa-stethoscope", color = "success")
+})
+```
+
+```{r}
+renderValueBox({
+  ids <- react_explo_meta()$nofinesset
+  n_de <- disciplines |> filter(nofinesset %in% ids) |> nrow()
+  n_eml <- materiels |> filter(nofinesset %in% ids) |> nrow()
+  valueBox(value = paste0(format(n_de, big.mark = " "), " / ", format(n_eml, big.mark = " ")), caption = "Disciplines / Matériels", icon = "fa-cogs", color = "warning")
+})
+```
+
+Column {.tabset}
+-----------------------------------------------------------------------
+
+### Nuage de mots
+
+```{r}
+renderWordcloud2({
+  wc <- react_explo_tokens() |> count(token_norm, sort = TRUE) |> slice_head(n = input$top_n) |> rename(word = token_norm, freq = n)
+  validate(need(nrow(wc) > 0, "Aucun terme disponible pour ce filtre."))
+  wordcloud2(data = wc, size = 0.7, minSize = 6, rotateRatio = 0.2, color = "random-dark", backgroundColor = "#f7f9fb")
+})
+```
+
+### Bigrammes
+
+```{r}
+renderPlotly({
+  df <- react_explo_bigrams() |> count(bigram, sort = TRUE) |> slice_head(n = input$top_n) |> mutate(bigram = forcats::fct_reorder(bigram, n))
+  validate(need(nrow(df) > 0, "Aucun bigramme disponible pour ce filtre."))
+  p <- ggplot(df, aes(x = bigram, y = n)) + geom_col(fill = couleur_principale) + coord_flip() + labs(x = NULL, y = "Occurrences") + theme_minimal()
+  ggplotly(p, tooltip = c("x", "y"))
+})
+```
+
+### Spécificités (TF-IDF)
+
+```{r}
+renderPlotly({
+  validate(need(input$dep_select_explo != "Tous", "Sélectionnez un département spécifique pour visualiser ses termes uniques (TF-IDF)."))
+  df <- dep_tfidf |> filter(departement == input$dep_select_explo) |> slice_max(order_by = tf_idf, n = input$top_n, with_ties = FALSE) |> mutate(token_norm = forcats::fct_reorder(token_norm, tf_idf))
+  validate(need(nrow(df) > 0, "Aucun terme TF-IDF disponible pour ce département."))
+  p <- ggplot(df, aes(x = token_norm, y = tf_idf)) + geom_col(fill = couleur_accent) + coord_flip() + labs(x = NULL, y = "Score TF-IDF") + theme_minimal()
+  ggplotly(p, tooltip = c("x", "y"))
+})
+```
+
+### Table des termes
+```{r}
+renderDT({
+  react_explo_tokens() |> count(token_norm, sort = TRUE, name = "frequence") |> slice_head(n = input$top_n) |> datatable(rownames = FALSE, options = list(pageLength = 12, dom = "tip"))
+})
+```
+
+# Cartographie
+
+Column {.sidebar data-width=300}
+-----------------------------------------------------------------------
+
+### Filtres cartographiques
+
+```{r}
+selectInput("dep_select_carto", "Sélection du département", choices = dep_choices, selected = "Tous", selectize = TRUE)
+selectInput("map_metric_carto", "Indicateur cartographique", choices = map_metric_choices, selected = "n_etab", selectize = FALSE)
+HTML("<b>Lecture :</b> changer d'indicateur pour comparer le volume brut et l'intensité d'offre.<br>Le filtre département permet de focaliser les analyses détaillées.")
+
+react_carto_geo <- reactive({
+  req(input$dep_select_carto)
+  if(input$dep_select_carto == "Tous") dep_geo else filter(dep_geo, departement == input$dep_select_carto)
+})
+```
+
+Column {.tabset}
+-----------------------------------------------------------------------
+
+### Carte départementale
+
+```{r}
+renderLeaflet({
+  d <- react_carto_geo()
+  validate(need(nrow(d) > 0, "Aucune géométrie disponible."))
+  metric_id <- input$map_metric_carto
+  metric_label <- names(map_metric_choices)[match(metric_id, map_metric_choices)]
+  
+  d <- d |> mutate(metric_value = .data[[metric_id]])
+  pal <- colorNumeric(palette = "YlGnBu", domain = dep_geo[[metric_id]], na.color = "#f0f0f0")
+
+  leaflet(d) |> addProviderTiles(providers$CartoDB.Positron) |>
+    addPolygons(
+      fillColor = ~pal(metric_value), weight = 1, color = "#4f5d75", opacity = 1, fillOpacity = 0.75,
+      label = ~paste0(departement, " - ", libdepartement, " | ", metric_label, " : ", scales::number(metric_value, accuracy = 0.1)),
+      popup = ~paste0("<b>", departement, " - ", libdepartement, "</b><br>Etablissements: ", format(n_etab, big.mark=" "), "<br>Indice composite: ", scales::number(score_acces, accuracy=0.1), "<br><b>Thèmes dominants:</b><br>", htmltools::htmlEscape(top_themes))
+    ) |> addLegend("bottomright", pal = pal, values = dep_geo[[metric_id]], title = metric_label, opacity = 0.85)
+})
+```
+
+### Profil territorial
+
+```{r}
+renderPlotly({
+  df <- dep_geo |> st_drop_geometry() |> filter(n_etab > 0)
+  df <- if (input$dep_select_carto == "Tous") mutate(df, selection = "Autres") else mutate(df, selection = if_else(departement == input$dep_select_carto, "Sélection", "Autres"))
+
+  p <- ggplot(df, aes(x = n_etab, y = n_act_per_100, size = n_eml_per_100, color = selection, text = paste0(departement, " - ", libdepartement, "<br>Etablissements: ", n_etab, "<br>Activités/100: ", round(n_act_per_100, 1)))) +
+    geom_point(alpha = 0.85) + scale_color_manual(values = c("Autres" = "#6c757d", "Sélection" = couleur_principale)) +
+    labs(x = "Nombre d'établissements", y = "Activités de soin pour 100 établissements", size = "Matériels lourds / 100") + theme_minimal()
+  ggplotly(p, tooltip = "text")
+})
+```
+
+### Classement
+
+```{r}
+renderPlotly({
+  metric_id <- input$map_metric_carto
+  metric_label <- names(map_metric_choices)[match(metric_id, map_metric_choices)]
+  df <- dep_geo |> st_drop_geometry() |> filter(n_etab > 0) |> transmute(departement = paste0(departement, " - ", libdepartement), metric_value = .data[[metric_id]]) |> arrange(desc(metric_value))
+  df <- if (input$dep_select_carto == "Tous") slice_head(df, n = 20) else mutate(df, selection = if_else(str_detect(departement, paste0("^", input$dep_select_carto, " - ")), "Sélection", "Autres"))
+
+  p <- ggplot(df, aes(x = forcats::fct_reorder(departement, metric_value), y = metric_value)) + geom_col(fill = couleur_principale) + coord_flip() + labs(x = NULL, y = metric_label) + theme_minimal()
+  ggplotly(p, tooltip = c("x", "y"))
+})
+```
+
+# Analyses avancées
+
+Column {.sidebar data-width=320}
+-----------------------------------------------------------------------
+
+### Filtres des axes avancés
+
+```{r}
+selectInput("dep_select_axes", "Sélection du département", choices = dep_choices, selected = "Tous", selectize = TRUE)
+HTML("<b>Objectif :</b> relier sémantique, équipement, maturité numérique et diversité territoriale.<br>Le filtre département applique une lecture locale des trois axes.")
+
+react_axes_term <- reactive({
+  req(input$dep_select_axes)
+  if(input$dep_select_axes == "Tous") term_equipment_long else filter(term_equipment_long, departement == input$dep_select_axes)
+})
+```
+
+Column {.tabset}
+-----------------------------------------------------------------------
+
+### Matériels vs Noms
+
+```{r}
+renderPlotly({
+  df <- react_axes_term() |> group_by(term, term_present) |> summarise(equipements_moyens = mean(n_eml_etab), .groups = "drop") |> mutate(presence = if_else(term_present, "Terme présent", "Terme absent"))
+  validate(need(nrow(df) > 0, "Aucune donnée pour cette sélection."))
+  p <- ggplot(df, aes(x = term, y = equipements_moyens, fill = presence)) + geom_col(position = position_dodge(width = 0.8), width = 0.7) + scale_fill_manual(values = c("Terme absent" = "#D3D3D3", "Terme présent" = couleur_principale)) + labs(x = NULL, y = "Matériels lourds moyens", fill = NULL) + theme_minimal()
+  ggplotly(p, tooltip = c("x", "y", "fill"))
+})
+```
+
+### Maturité numérique (Carte)
+
+```{r}
+renderLeaflet({
+  d <- if(input$dep_select_axes == "Tous") dep_geo else filter(dep_geo, departement == input$dep_select_axes)
+  validate(need(nrow(d) > 0, "Aucune géométrie disponible."))
+  pal <- colorNumeric(palette = "YlOrRd", domain = dep_geo$hubs_per_100, na.color = "#f0f0f0")
+
+  leaflet(d) |> addProviderTiles(providers$CartoDB.Positron) |>
+    addPolygons(
+      fillColor = ~pal(hubs_per_100), weight = 1, color = "#4f5d75", opacity = 1, fillOpacity = 0.8,
+      label = ~paste0(departement, " - ", libdepartement, " | Hubs innovation /100 : ", round(hubs_per_100, 1)),
+      popup = ~paste0("<b>", departement, "</b><br>Pôles innovation (nom + etalab): ", n_hubs)
+    ) |> addLegend("bottomright", pal = pal, values = dep_geo$hubs_per_100, title = "Hubs innovation /100")
+})
+```
+
+### Déserts Sémantiques
+
+```{r}
+renderPlotly({
+  df <- dep_diversity_scatter
+  df <- if (input$dep_select_axes == "Tous") df else mutate(df, profil = if_else(departement == input$dep_select_axes, "Sélection", profil))
+
+  p <- ggplot(df, aes(x = n_etab_total, y = mots_uniques_par_etab, size = score_diversite_sem, color = profil, text = paste0(departement, " - ", libdepartement, "<br>Mots uniques / etab: ", round(mots_uniques_par_etab, 2)))) +
+    geom_point(alpha = 0.85) + scale_color_manual(values = c("Profil standard" = "#6c757d", "Peu d'établissements / forte diversité" = couleur_secondaire, "Sélection" = couleur_accent)) +
+    labs(x = "Nombre total d'établissements", y = "Mots-clés uniques par établissement", size = "Entropie sémantique", color = NULL) + theme_minimal()
+  ggplotly(p, tooltip = "text")
+})
+```
