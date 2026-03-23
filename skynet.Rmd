@@ -425,6 +425,26 @@ div_semantique <- tokens_etab |>
     .groups = "drop"
   )
 
+# 8g. Dictionnaire des mots-clés structurels (utilisé par 2 visualisations)
+motifs_struct <- tibble::tribble(
+  ~categorie,                ~pattern,                                                              ~explication,
+  "Pharmacie",              "\\bpharmacie\\b|\\bpharmacies\\b|\\bofficine\\b|\\bofficines\\b", "Officine ou structure pharmaceutique",
+  "Hopital / CH",           "\\bhopital\\b|\\bhopitaux\\b|\\bchu\\b|\\bchru\\b|\\bchr\\b",     "Hopitaux et centres hospitaliers",
+  "Clinique",               "\\bclinique\\b|\\bcliniques\\b",                                "Etablissements de type clinique",
+  "SSIAD / SSAD",           "\\bssiad\\b|\\bssad\\b",                                        "Services de soins infirmiers a domicile",
+  "EHPAD",                  "\\behpad\\b",                                                      "Etablissements d'hebergement pour personnes agees dependantes",
+  "SSR",                    "\\bssr\\b",                                                        "Soins de suite et de readaptation",
+  "HAD",                    "\\bhad\\b|hospitalisation a domicile",                             "Hospitalisation a domicile",
+  "Maison de sante",        "maison de sante",                                                     "Maison de sante pluriprofessionnelle",
+  "Centre de sante",        "centre de sante",                                                     "Structure ambulatoire de soins",
+  "CMP",                    "\\bcmp\\b|centre medico psychologique",                             "Centre medico-psychologique",
+  "IME",                    "\\bime\\b|institut medico educatif",                               "Institut medico-educatif",
+  "ESAT",                   "\\besat\\b",                                                       "Etablissement et service d'aide par le travail",
+  "MAS",                    "\\bmas\\b|maison d accueil specialisee",                            "Maison d'accueil specialisee",
+  "FAM",                    "\\bfam\\b|foyer d accueil medicalise",                              "Foyer d'accueil medicalise",
+  "SESSAD",                 "\\bsessad\\b",                                                     "Service d'education speciale et de soins a domicile"
+)
+
 
 # ── 9. Données temporelles ───────────────────────────────────────────────────
 # Analyse de l'évolution des autorisations dans le temps.
@@ -1224,9 +1244,19 @@ renderPlot({
     tokens_etab |> filter(dep == !!dep)
   }
 
-  wc <- filtered_tokens |>
+  wc_all <- filtered_tokens |>
     count(word_norm, sort = TRUE) |>
+    slice_head(n = max(top_n, 200))
+
+  wc <- wc_all |>
     slice_head(n = top_n)
+
+  # Si present dans la selection, on force l'affichage de "pharmacie" dans le nuage.
+  if ("pharmacie" %in% wc_all$word_norm && !("pharmacie" %in% wc$word_norm)) {
+    wc <- wc |>
+      slice_head(n = max(1, top_n - 1)) |>
+      bind_rows(wc_all |> filter(word_norm == "pharmacie"))
+  }
 
   validate(need(nrow(wc) > 0, "Aucun terme disponible pour ce filtre."))
 
@@ -1295,27 +1325,7 @@ renderPlotly({
 
   validate(need(nrow(df) > 0, "Aucun établissement disponible pour ce filtre."))
 
-  # Dictionnaire de motifs orienté métier (sur texte normalisé)
-  motifs <- tibble::tribble(
-    ~categorie,                ~pattern,
-    "Pharmacie",              "\\bpharmacie\\b|\\bpharmacies\\b|\\bofficine\\b|\\bofficines\\b",
-    "Hopital / CH",           "\\bhopital\\b|\\bhopitaux\\b|\\bchu\\b|\\bchru\\b|\\bchr\\b",
-    "Clinique",               "\\bclinique\\b|\\bcliniques\\b",
-    "SSIAD / SSAD",           "\\bssiad\\b|\\bssad\\b",
-    "EHPAD",                  "\\behpad\\b",
-    "SSR",                    "\\bssr\\b",
-    "HAD",                    "\\bhad\\b|hospitalisation a domicile",
-    "Maison de sante",        "maison de sante",
-    "Centre de sante",        "centre de sante",
-    "CMP",                    "\\bcmp\\b|centre medico psychologique",
-    "IME",                    "\\bime\\b|institut medico educatif",
-    "ESAT",                   "\\besat\\b",
-    "MAS",                    "\\bmas\\b|maison d accueil specialisee",
-    "FAM",                    "\\bfam\\b|foyer d accueil medicalise",
-    "SESSAD",                 "\\bsessad\\b"
-  )
-
-  df_cat <- motifs |>
+  df_cat <- motifs_struct |>
     rowwise() |>
     mutate(
       n = sum(stringr::str_detect(normalize_text(df$text_clean), stringr::regex(pattern))),
@@ -1347,6 +1357,42 @@ renderPlotly({
 
   ggplotly(p, tooltip = "text") |>
     layout(font = list(family = "IBM Plex Sans"))
+})
+```
+
+### 📋 Table d'explication des mots
+
+```{r p3-table-explication}
+# Table explicative : definition des categories + motifs + volume detecte.
+renderDT({
+  dep <- input$dep_text
+
+  df <- if (dep == "Tous") corpus_etab else corpus_etab |> filter(dep == !!dep)
+
+  validate(need(nrow(df) > 0, "Aucun établissement disponible pour ce filtre."))
+
+  df_exp <- motifs_struct |>
+    rowwise() |>
+    mutate(
+      `Nb etablissements` = sum(stringr::str_detect(normalize_text(df$text_clean), stringr::regex(pattern))),
+      `Part (%)` = round(100 * `Nb etablissements` / nrow(df), 1)
+    ) |>
+    ungroup() |>
+    arrange(desc(`Nb etablissements`)) |>
+    transmute(
+      Categorie = categorie,
+      Explication = explication,
+      `Motif detecte (regex)` = pattern,
+      `Nb etablissements`,
+      `Part (%)`
+    )
+
+  datatable(
+    df_exp,
+    rownames = FALSE,
+    class = "stripe hover compact",
+    options = list(pageLength = 12, scrollX = TRUE)
+  )
 })
 ```
 
