@@ -284,17 +284,32 @@ dep_etalab <- activites_clean |>
   left_join(etalab_map, by = "nofinesset") |>
   group_by(dep) |>
   summarise(
-    n_etab_total   = n_distinct(nofinesset),
+    n_etab_total_act = n_distinct(nofinesset),
     n_avec_etalab  = n_distinct(nofinesset[!is.na(etalab)]),
-    pct_etalab     = 100 * n_avec_etalab / n_etab_total,
+    pct_etalab     = 100 * n_avec_etalab / n_etab_total_act,
     .groups = "drop"
   )
+
+# --- 6f. Total etablissements FINESS par departement ----------------------
+# Cette base sert de reference de volume territorial (ex: Territoire de Belfort).
+dep_etab_total <- etablissements |>
+  transmute(
+    nofinesset,
+    dep = dplyr::coalesce(
+      dplyr::na_if(stringr::str_to_upper(stringr::str_trim(departement)), ""),
+      extract_dep(nofinesset)
+    )
+  ) |>
+  filter(!is.na(dep), dep != "") |>
+  distinct(nofinesset, dep) |>
+  count(dep, name = "n_etab_total")
 
 # --- 6e. Table synthèse départementale (jointure de tout) ----------------
 dep_stats <- dep_act |>
   full_join(dep_dis,    by = "dep") |>
   full_join(dep_mat,    by = "dep") |>
   full_join(dep_etalab, by = "dep") |>
+  full_join(dep_etab_total, by = "dep") |>
   mutate(
     across(where(is.integer), ~replace_na(., 0L)),
     across(where(is.double),  ~replace_na(., 0)),
@@ -1019,224 +1034,265 @@ renderPlotly({
   sur un département pour consulter son profil détaillé.
 -->
 
-Column {.sidebar data-width=280}
+Column {.sidebar data-width=300}
 -----------------------------------------------------------------------
 
 ### Filtres cartographiques
 
 ```{r p2-filtres}
-# Sélecteur de métrique : choisit quelle colonne colore la carte
+map_metric_choices <- list(
+  "Nombre d'etablissements" = "n_etab",
+  "Activites/100 etablissements" = "n_act_per_100",
+  "Disciplines/100 etablissements" = "n_de_per_100",
+  "Materiels lourds/100 etablissements" = "n_eml_per_100",
+  "Indice composite" = "score_acces"
+)
+
 selectInput(
-  inputId   = "carto_metric",
-  label     = "Indicateur à cartographier",
-  choices   = map_metrics,
-  selected  = "score_offre",
+  inputId = "dep_select_carto",
+  label = "Selection du departement",
+  choices = dep_choices,
+  selected = "Tous",
+  selectize = TRUE
+)
+
+selectInput(
+  inputId = "map_metric_carto",
+  label = "Indicateur cartographique",
+  choices = map_metric_choices,
+  selected = "n_etab",
   selectize = FALSE
 )
 
-selectInput(
-  inputId   = "dep_carto",
-  label     = "Focus département",
-  choices   = dep_choices,
-  selected  = "Tous",
-  selectize = TRUE
-)
-```
-
-### Lecture des indicateurs
-
-```{r p2-info}
-HTML('
-<div class="info-card">
-  <strong>Indice composite (0-100)</strong><br>
-  Agrège : autorisations (40 %), formations (30 %), matériels (30 %). Échelle normalisée.<br><br>
-  <strong>Couverture ETALAB (%)</strong><br>
-  Part des établissements liés à un identifiant ETALAB open data — proxy de traçabilité numérique.
-</div>
-')
-```
-
-### Statistiques de sélection
-
-```{r p2-vb-score}
-# Value box : valeur moyenne de l'indicateur sélectionné
-renderValueBox({
-  m <- input$carto_metric
-  d <- if (input$dep_carto == "Tous") dep_geo
-       else dep_geo |> filter(dep == input$dep_carto)
-  val <- mean(d[[m]], na.rm = TRUE)
-  lbl <- names(map_metrics)[match(m, map_metrics)]
-  valueBox(scales::number(val, accuracy = .1), paste0("Moy. — ", str_trunc(lbl, 28)),
-           icon = "fa-bar-chart", color = "#2176ae")
-})
-```
-
-```{r p2-vb-max}
-# Value box : département avec la valeur maximale
-renderValueBox({
-  m <- input$carto_metric
-  d <- dep_geo |> sf::st_drop_geometry() |>
-    filter(!is.na(.data[[m]])) |>
-    slice_max(order_by = .data[[m]], n = 1)
-  valueBox(
-    paste0(d$dep[1], " — ", str_trunc(d$nom[1], 18)),
-    "Département le mieux doté",
-    icon = "fa-trophy", color = "#06a77d"
-  )
-})
+HTML(paste0(
+  "<b>Lecture :</b> changer d'indicateur pour comparer le volume brut et l'intensite d'offre.<br>",
+  "Le filtre departement permet de focaliser les analyses detaillees."
+))
 ```
 
 Column {.tabset}
 -----------------------------------------------------------------------
 
-### 🗺 Carte choroplèthe
+### Carte departementale
 
 ```{r p2-carte}
-# Carte Leaflet interactive : départements colorés selon l'indicateur choisi.
-# Popup au clic avec tous les indicateurs du département.
 renderLeaflet({
-  metric_id  <- input$carto_metric
-  metric_lbl <- names(map_metrics)[match(metric_id, map_metrics)]
+  metric_id <- input$map_metric_carto
+  metric_label <- names(map_metric_choices)[match(metric_id, map_metric_choices)]
 
-  # Filtrage géographique selon le sélecteur de département
-  d <- if (input$dep_carto == "Tous") dep_geo
-       else dep_geo |> filter(dep == input$dep_carto)
+  top_themes_tbl <- tfidf_dep |>
+    group_by(dep) |>
+    slice_max(order_by = tf_idf, n = 3, with_ties = FALSE) |>
+    summarise(top_themes = paste(word_norm, collapse = ", "), .groups = "drop")
 
-  validate(need(nrow(d) > 0, "Aucune géométrie disponible."))
+  dep_geo_carto <- dep_geo |>
+    mutate(
+      departement = dep,
+      libdepartement = nom,
+      n_etab = n_etab_total,
+      n_act_per_100 = if_else(n_etab > 0, 100 * n_autorisations / n_etab, NA_real_),
+      n_de_per_100 = if_else(n_etab > 0, 100 * n_formations / n_etab, NA_real_),
+      n_eml_per_100 = if_else(n_etab > 0, 100 * n_mat_total / n_etab, NA_real_),
+      score_acces = score_offre
+    ) |>
+    left_join(top_themes_tbl, by = c("dep" = "dep")) |>
+    mutate(top_themes = replace_na(top_themes, "Non disponible"))
 
-  # Palette de couleurs adaptée à la métrique
-  d <- d |> mutate(val_carte = .data[[metric_id]])
+  d <- if (input$dep_select_carto == "Tous") {
+    dep_geo_carto
+  } else {
+    dep_geo_carto |> filter(departement == input$dep_select_carto)
+  }
+
+  validate(need(nrow(d) > 0, "Aucune geometrie disponible pour ce departement."))
+
+  d <- d |>
+    mutate(metric_value = .data[[metric_id]])
+
   pal <- colorNumeric(
-    palette  = c("#e8f4fd", "#2176ae", "#1a3a5c"),
-    domain   = dep_geo[[metric_id]],
+    palette = "YlGnBu",
+    domain = dep_geo_carto[[metric_id]],
     na.color = "#f0f0f0"
   )
 
   leaflet(d) |>
     addProviderTiles(providers$CartoDB.Positron) |>
     addPolygons(
-      fillColor = ~pal(val_carte),
-      weight = 1, color = "#1a3a5c", opacity = .6, fillOpacity = .80,
-      smoothFactor = .3,
-      # Mise en surbrillance au survol
-      highlightOptions = highlightOptions(
-        weight = 2.5, color = "#00b4d8", bringToFront = TRUE
+      fillColor = ~pal(metric_value),
+      weight = 1,
+      color = "#4f5d75",
+      opacity = 1,
+      fillOpacity = 0.75,
+      smoothFactor = 0.2,
+      label = ~paste0(
+        departement, " - ", libdepartement,
+        " | ", metric_label, " : ", scales::number(metric_value, accuracy = 0.1)
       ),
-      # Tooltip flottant
-      label = ~lapply(paste0(
-        "<b>", dep, " — ", nom, "</b><br>",
-        metric_lbl, " : <b>", scales::number(val_carte, accuracy = .1), "</b>"
-      ), HTML),
-      # Popup détaillé au clic
       popup = ~paste0(
-        "<b style='color:#1a3a5c;font-size:1rem'>",
-        dep, " — ", nom, "</b><hr style='margin:5px 0'>",
-        "🏥 Établissements : <b>", format(n_etab_act, big.mark = "\u202f"), "</b><br>",
-        "📋 Autorisations : <b>", format(n_autorisations, big.mark = "\u202f"), "</b><br>",
-        "🎯 Types d'activités : <b>", n_types_act, "</b><br>",
-        "🎓 Formations : <b>", format(n_formations, big.mark = "\u202f"),
-        " (cap. ", format(cap_total, big.mark = "\u202f"), " places)</b><br>",
-        "🔬 Matériels lourds : <b>", n_mat_total,
-        " (IRM : ", n_irm, " | Scanner : ", n_scanner, ")</b><br>",
-        "🔗 Couverture ETALAB : <b>", scales::number(pct_etalab, accuracy = .1), " %</b><br>",
-        "📊 Indice composite : <b>", scales::number(score_offre, accuracy = .1), "/100</b>"
+        "<b>", departement, " - ", libdepartement, "</b><br>",
+        "Etablissements: ", format(n_etab, big.mark = " "), "<br><br>",
+        "Activites/100 etab: ", scales::number(n_act_per_100, accuracy = 0.1), "<br>",
+        "Disciplines/100 etab: ", scales::number(n_de_per_100, accuracy = 0.1), "<br>",
+        "Materiels lourds/100 etab: ", scales::number(n_eml_per_100, accuracy = 0.1), "<br>",
+        "Indice composite: ", scales::number(score_acces, accuracy = 0.1), "<br><br>",
+        "<b>Themes dominants:</b><br>",
+        htmltools::htmlEscape(top_themes)
       )
     ) |>
     addLegend(
-      "bottomright", pal = pal, values = dep_geo[[metric_id]],
-      title = metric_lbl, opacity = .88,
-      labFormat = labelFormat(digits = 1)
+      "bottomright",
+      pal = pal,
+      values = dep_geo_carto[[metric_id]],
+      title = metric_label,
+      opacity = 0.85
     )
 })
 ```
 
-### 🏆 Classement des départements
+### Profil territorial
 
-```{r p2-classement}
-# Graphique en barres : top départements pour l'indicateur sélectionné.
-# Le département sélectionné est mis en valeur en orange.
+```{r p2-profil-territorial}
 renderPlotly({
-  metric_id  <- input$carto_metric
-  metric_lbl <- names(map_metrics)[match(metric_id, map_metrics)]
-
-  df <- dep_geo |> sf::st_drop_geometry() |>
-    filter(!is.na(.data[[metric_id]])) |>
-    transmute(
-      dep, nom,
-      valeur = .data[[metric_id]],
-      label  = paste0(dep, " — ", nom)
+  df <- dep_geo |>
+    st_drop_geometry() |>
+    mutate(
+      departement = dep,
+      libdepartement = nom,
+      n_etab = n_etab_total,
+      n_act_per_100 = if_else(n_etab > 0, 100 * n_autorisations / n_etab, NA_real_),
+      n_de_per_100 = if_else(n_etab > 0, 100 * n_formations / n_etab, NA_real_),
+      n_eml_per_100 = if_else(n_etab > 0, 100 * n_mat_total / n_etab, NA_real_),
+      score_acces = score_offre
     ) |>
-    arrange(desc(valeur))
+    filter(n_etab > 0)
 
-  # En mode "Tous" : top 20 ; sinon on situe le département sélectionné
-  df <- if (input$dep_carto == "Tous") {
-    df |> slice_head(n = 20) |> mutate(sel = "standard")
+  df <- if (input$dep_select_carto == "Tous") {
+    df |>
+      mutate(selection = "Autres")
   } else {
-    df |> mutate(sel = if_else(dep == input$dep_carto, "selection", "standard"))
+    df |>
+      mutate(selection = if_else(departement == input$dep_select_carto, "Departement selectionne", "Autres"))
   }
 
-  couleurs <- c("standard" = PAL$secondary, "selection" = PAL$warn)
-
-  p <- ggplot(df, aes(
-    x = forcats::fct_reorder(label, valeur), y = valeur, fill = sel,
-    text = paste0("<b>", label, "</b><br>",
-                  metric_lbl, " : ", scales::number(valeur, accuracy = .1))
-  )) +
-    geom_col(width = .78) +
-    scale_fill_manual(values = couleurs, guide = "none") +
-    coord_flip() +
-    scale_y_continuous(expand = expansion(mult = c(0, .12))) +
+  p <- ggplot(
+    df,
+    aes(
+      x = n_etab,
+      y = n_act_per_100,
+      size = n_eml_per_100,
+      color = selection,
+      text = paste0(
+        departement, " - ", libdepartement,
+        "<br>Etablissements: ", format(n_etab, big.mark = " "),
+        "<br>Activites/100: ", scales::number(n_act_per_100, accuracy = 0.1),
+        "<br>Materiels lourds/100: ", scales::number(n_eml_per_100, accuracy = 0.1),
+        "<br>Indice: ", scales::number(score_acces, accuracy = 0.1)
+      )
+    )
+  ) +
+    geom_point(alpha = 0.85) +
+    scale_color_manual(values = c("Autres" = "#6c757d", "Departement selectionne" = "#1f77b4")) +
+    scale_size_continuous(range = c(3, 14)) +
     labs(
-      x = NULL, y = metric_lbl,
-      title = paste0("Classement — ", str_trunc(metric_lbl, 45))
+      x = "Nombre d'etablissements",
+      y = "Activites de soin pour 100 etablissements",
+      size = "Materiels lourds / 100",
+      color = NULL,
+      title = "Volume vs intensite de l'offre"
     ) +
-    theme_finess()
+    theme_minimal(base_size = 12)
 
-  ggplotly(p, tooltip = "text") |>
-    layout(font = list(family = "IBM Plex Sans"))
+  ggplotly(p, tooltip = "text")
 })
 ```
 
-### 🔵 Profil comparatif
+### Comparaison multi-indicateurs
 
-```{r p2-scatter}
-# Nuage de points : activités vs formations, taille = matériels lourds.
-# Permet de repérer les départements sur-/sous-dotés.
+```{r p2-comparaison-multi}
 renderPlotly({
-  df <- dep_geo |> sf::st_drop_geometry() |>
-    filter(n_etab_act > 0) |>
+  df <- dep_geo |>
+    st_drop_geometry() |>
     mutate(
-      sel = if (input$dep_carto != "Tous")
-        if_else(dep == input$dep_carto, "Sélection", "Autres")
-      else "Tous"
-    )
+      departement = dep,
+      libdepartement = nom,
+      n_etab = n_etab_total,
+      n_act_per_100 = if_else(n_etab > 0, 100 * n_autorisations / n_etab, NA_real_),
+      n_de_per_100 = if_else(n_etab > 0, 100 * n_formations / n_etab, NA_real_),
+      n_eml_per_100 = if_else(n_etab > 0, 100 * n_mat_total / n_etab, NA_real_),
+      score_acces = score_offre
+    ) |>
+    filter(n_etab > 0)
 
-  couleurs <- c("Tous" = PAL$secondary, "Autres" = "#9ab8d4", "Sélection" = PAL$warn)
+  df <- if (input$dep_select_carto == "Tous") {
+    df |>
+      arrange(desc(score_acces)) |>
+      slice_head(n = 20)
+  } else {
+    df |> filter(departement == input$dep_select_carto)
+  }
 
-  p <- ggplot(df, aes(
-    x = n_autorisations, y = n_formations, size = n_mat_total, color = sel,
-    text = paste0(
-      "<b>", dep, " — ", nom, "</b><br>",
-      "Autorisations : ", format(n_autorisations, big.mark = "\u202f"), "<br>",
-      "Formations : ", format(n_formations, big.mark = "\u202f"), "<br>",
-      "Matériels lourds : ", n_mat_total, "<br>",
-      "Indice : ", scales::number(score_offre, accuracy = .1), "/100"
-    )
-  )) +
-    geom_point(alpha = .82) +
-    scale_color_manual(values = couleurs) +
-    scale_size_continuous(range = c(3, 16)) +
-    labs(
-      x = "Nombre d'autorisations d'activité",
-      y = "Nombre de lignes de formation",
-      size = "Matériels lourds", color = NULL,
-      title = "Profil comparatif des départements",
-      subtitle = "Taille des bulles = nb de matériels lourds recensés"
-    ) +
-    theme_finess()
+  validate(need(nrow(df) > 0, "Pas de departement a afficher."))
 
-  ggplotly(p, tooltip = "text") |>
-    layout(font = list(family = "IBM Plex Sans"))
+  heat <- df |>
+    transmute(
+      departement = paste0(departement, " - ", libdepartement),
+      `Activites/100` = n_act_per_100,
+      `Disciplines/100` = n_de_per_100,
+      `Materiels/100` = n_eml_per_100,
+      `Indice acces` = score_acces
+    ) |>
+    pivot_longer(-departement, names_to = "indicateur", values_to = "valeur")
+
+  p <- ggplot(heat, aes(x = indicateur, y = forcats::fct_rev(departement), fill = valeur)) +
+    geom_tile(color = "white", linewidth = 0.2) +
+    scale_fill_viridis_c(option = "C") +
+    labs(x = NULL, y = NULL, fill = "Valeur", title = "Lecture comparative des departements") +
+    theme_minimal(base_size = 12) +
+    theme(panel.grid = element_blank())
+
+  ggplotly(p)
+})
+```
+
+### Classement de l'indicateur choisi
+
+```{r p2-classement-indicateur}
+renderPlotly({
+  metric_id <- input$map_metric_carto
+  metric_label <- names(map_metric_choices)[match(metric_id, map_metric_choices)]
+
+  df <- dep_geo |>
+    st_drop_geometry() |>
+    mutate(
+      departement = dep,
+      libdepartement = nom,
+      n_etab = n_etab_total,
+      n_act_per_100 = if_else(n_etab > 0, 100 * n_autorisations / n_etab, NA_real_),
+      n_de_per_100 = if_else(n_etab > 0, 100 * n_formations / n_etab, NA_real_),
+      n_eml_per_100 = if_else(n_etab > 0, 100 * n_mat_total / n_etab, NA_real_),
+      score_acces = score_offre
+    ) |>
+    filter(n_etab > 0) |>
+    transmute(
+      departement = paste0(departement, " - ", libdepartement),
+      metric_value = .data[[metric_id]]
+    ) |>
+    arrange(desc(metric_value))
+
+  df <- if (input$dep_select_carto == "Tous") {
+    df |> slice_head(n = 20)
+  } else {
+    df |>
+      mutate(selection = if_else(str_detect(departement, paste0("^", input$dep_select_carto, " - ")), "Selection", "Autres"))
+  }
+
+  p <- ggplot(df, aes(x = forcats::fct_reorder(departement, metric_value), y = metric_value)) +
+    geom_col(fill = "#457b9d") +
+    coord_flip() +
+    labs(x = NULL, y = metric_label, title = paste0("Classement - ", metric_label)) +
+    theme_minimal(base_size = 12)
+
+  ggplotly(p, tooltip = c("x", "y"))
 })
 ```
 
@@ -1965,49 +2021,6 @@ renderValueBox({
 
 Column {.tabset}
 -----------------------------------------------------------------------
-
-### 🔬 Carte des équipements lourds
-
-```{r p5-carte-mat}
-# Carte Leaflet focalisée sur les matériels lourds par département.
-# Palette spécifique (orange → rouge) pour différencier de la page Cartographie.
-renderLeaflet({
-  d <- if (input$dep_equip == "Tous") dep_geo
-       else dep_geo |> filter(dep == input$dep_equip)
-
-  validate(need(nrow(d) > 0, "Aucune géométrie disponible."))
-
-  pal <- colorNumeric(
-    palette  = c("#fff3e0", "#f4a261", "#c1121f"),
-    domain   = dep_geo$n_mat_total,
-    na.color = "#f0f0f0"
-  )
-
-  leaflet(d) |>
-    addProviderTiles(providers$CartoDB.Positron) |>
-    addPolygons(
-      fillColor  = ~pal(n_mat_total),
-      weight = 1, color = "#5c2a00", opacity = .5, fillOpacity = .82,
-      highlightOptions = highlightOptions(weight = 2.5, color = "#00b4d8", bringToFront = TRUE),
-      label = ~lapply(paste0(
-        "<b>", dep, " — ", nom, "</b><br>",
-        "Matériels : <b>", n_mat_total, "</b> | IRM : <b>", n_irm,
-        "</b> | Scanner : <b>", n_scanner, "</b>"
-      ), HTML),
-      popup = ~paste0(
-        "<b style='color:#1a3a5c'>", dep, " — ", nom, "</b><hr style='margin:5px 0'>",
-        "🔬 Total matériels lourds : <b>", n_mat_total, "</b><br>",
-        "🧲 IRM cliniques : <b>", n_irm, "</b><br>",
-        "💿 Scanners : <b>", n_scanner, "</b><br>",
-        "☢️ Tomographes TEP : <b>", n_tep, "</b><br>",
-        "🎓 Capacité de formation : <b>",
-        format(cap_total, big.mark = "\u202f"), " places</b>"
-      )
-    ) |>
-    addLegend("bottomright", pal = pal, values = dep_geo$n_mat_total,
-              title = "Matériels lourds", opacity = .88)
-})
-```
 
 ### 🎓 Capacités de formation
 
