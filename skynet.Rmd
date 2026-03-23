@@ -359,11 +359,13 @@ stop_fr <- tibble(
 stop_metier <- tibble(
   word_norm = c(
     "centre", "centres", "etablissement", "etablissements", "site", "sites",
-    "hopital", "hospitalier", "hospitaliere", "hospitaliers", "hospitalieres",
-    "clinique", "cliniques", "groupement", "pole", "poles", "service", "services",
-    "unite", "unites", "maison", "sante", "institut", "association", "residence",
-    "foyer", "chu", "chru", "chr", "ssr", "ehpad", "de", "du", "des", "d", "l",
-    "le", "la", "les", "aux", "sur", "chez", "en", "au", "et", "ou"
+    "groupement", "pole", "poles", "service", "services", "unite", "unites",
+    "maison", "sante", "institut", "association", "residence", "foyer",
+    "de", "du", "des", "d", "l", "le", "la", "les", "aux", "sur",
+    "chez", "en", "au", "et", "ou",
+    # Formes juridiques à exclure (peu informatives pour l'analyse métier)
+    "sa", "sas", "sasu", "sarl", "selarl", "selas", "scp", "scm", "sci",
+    "eurl", "gie", "ei", "sea", "searl"
   )
 )
 stop_all <- bind_rows(stop_fr, stop_metier) |>
@@ -376,7 +378,11 @@ tokens_etab <- corpus_etab |>
     input  = text_clean,
     token  = "words"
   ) |>
-  mutate(word_norm = normalize_text(word)) |>
+  mutate(
+    word_norm = normalize_text(word),
+    # Harmonisation : certains noms utilisent "SSAD" au lieu de "SSIAD"
+    word_norm = dplyr::if_else(word_norm %in% c("ssad", "ssiad"), "ssiad", word_norm)
+  ) |>
   filter(
     stringr::str_detect(word_norm, "[a-z]"),
     stringr::str_length(word_norm) > 2
@@ -1277,28 +1283,56 @@ renderPlotly({
 })
 ```
 
-### 🔗 Bigrammes
+### 🏥 Mots-clés établissements
 
 ```{r p3-bigrams}
-# Paires de mots consécutifs (bigrammes) les plus fréquentes.
-# Révèle les associations sémantiques récurrentes (ex : "soins palliatifs").
+# Présence de mots-clés structurels dans les noms d'établissements.
+# Cette vue cible explicitement les termes demandés (hôpital, clinique, SSIAD...).
 renderPlotly({
-  top_n <- max(1L, as.integer(input$top_n_text %||% 30L))
   dep   <- input$dep_text
 
-  df <- if (dep == "Tous") bigrams_etab else bigrams_etab |> filter(dep == !!dep)
+  df <- if (dep == "Tous") corpus_etab else corpus_etab |> filter(dep == !!dep)
 
-  df_agg <- df |>
-    count(bigram, sort = TRUE) |>
-    slice_head(n = top_n) |>
-    mutate(bigram = forcats::fct_reorder(bigram, n))
+  validate(need(nrow(df) > 0, "Aucun établissement disponible pour ce filtre."))
 
-  validate(need(nrow(df_agg) > 0, "Aucun bigramme disponible."))
+  # Dictionnaire de motifs orienté métier (sur texte normalisé)
+  motifs <- tibble::tribble(
+    ~categorie,                ~pattern,
+    "Pharmacie",              "\\bpharmacie\\b|\\bpharmacies\\b|\\bofficine\\b|\\bofficines\\b",
+    "Hopital / CH",           "\\bhopital\\b|\\bhopitaux\\b|\\bchu\\b|\\bchru\\b|\\bchr\\b",
+    "Clinique",               "\\bclinique\\b|\\bcliniques\\b",
+    "SSIAD / SSAD",           "\\bssiad\\b|\\bssad\\b",
+    "EHPAD",                  "\\behpad\\b",
+    "SSR",                    "\\bssr\\b",
+    "HAD",                    "\\bhad\\b|hospitalisation a domicile",
+    "Maison de sante",        "maison de sante",
+    "Centre de sante",        "centre de sante",
+    "CMP",                    "\\bcmp\\b|centre medico psychologique",
+    "IME",                    "\\bime\\b|institut medico educatif",
+    "ESAT",                   "\\besat\\b",
+    "MAS",                    "\\bmas\\b|maison d accueil specialisee",
+    "FAM",                    "\\bfam\\b|foyer d accueil medicalise",
+    "SESSAD",                 "\\bsessad\\b"
+  )
 
-  p <- ggplot(df_agg, aes(
-    x = bigram, y = n,
-    text = paste0("<b>", bigram, "</b><br>",
-                  format(n, big.mark = "\u202f"), " occurrences")
+  df_cat <- motifs |>
+    rowwise() |>
+    mutate(
+      n = sum(stringr::str_detect(normalize_text(df$text_clean), stringr::regex(pattern))),
+      pct = 100 * n / nrow(df)
+    ) |>
+    ungroup() |>
+    filter(n > 0) |>
+    arrange(desc(n)) |>
+    mutate(categorie = forcats::fct_reorder(categorie, n))
+
+  validate(need(nrow(df_cat) > 0, "Aucun mot-clé structurel détecté."))
+
+  p <- ggplot(df_cat, aes(
+    x = categorie, y = n,
+    text = paste0("<b>", categorie, "</b><br>",
+                  format(n, big.mark = "\u202f"), " établissements<br>",
+                  "Soit ", scales::number(pct, accuracy = .1), " % de la sélection")
   )) +
     geom_col(fill = PAL$success, width = .78) +
     geom_text(aes(label = n), hjust = -.12, size = 3, colour = PAL$muted) +
@@ -1306,8 +1340,8 @@ renderPlotly({
     scale_y_continuous(expand = expansion(mult = c(0, .15))) +
     labs(
       x = NULL, y = "Occurrences",
-      title = "Bigrammes les plus fréquents",
-      subtitle = "Associations de deux mots dans les noms d'établissements"
+      title = "Mots-clés structurels dans les noms d'établissements",
+      subtitle = "Comptage des établissements contenant des termes comme hopital, clinique, SSIAD/SSAD..."
     ) +
     theme_finess()
 
