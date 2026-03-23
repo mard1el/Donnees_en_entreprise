@@ -1477,68 +1477,60 @@ renderPlotly({
 })
 ```
 
-### 📋 Table d'explication des mots
+### 📚 Glossaire unifié
 
-```{r p3-table-explication}
-# Table explicative : definition des categories + motifs + volume detecte.
+```{r p3-glossaire-unifie}
+# Glossaire unique : fusion des mots-cles structurels et des termes metier.
 renderDT({
   dep <- input$dep_text
 
-  df <- if (dep == "Tous") corpus_etab else corpus_etab |> filter(dep == !!dep)
+  df_etab <- if (dep == "Tous") corpus_etab else corpus_etab |> filter(dep == !!dep)
+  df_tokens <- if (dep == "Tous") tokens_etab else tokens_etab |> filter(dep == !!dep)
 
-  validate(need(nrow(df) > 0, "Aucun établissement disponible pour ce filtre."))
+  validate(need(nrow(df_etab) > 0, "Aucun établissement disponible pour ce filtre."))
 
-  df_exp <- motifs_struct |>
+  gloss_struct <- motifs_struct |>
     rowwise() |>
     mutate(
-      `Nb etablissements` = sum(stringr::str_detect(normalize_text(df$text_clean), stringr::regex(pattern))),
-      `Part (%)` = round(100 * `Nb etablissements` / nrow(df), 1)
+      `Nb etablissements` = sum(stringr::str_detect(normalize_text(df_etab$text_clean), stringr::regex(pattern))),
+      `Part (%)` = round(100 * `Nb etablissements` / nrow(df_etab), 1)
     ) |>
     ungroup() |>
-    arrange(desc(`Nb etablissements`)) |>
+    filter(`Nb etablissements` > 0) |>
     transmute(
-      Categorie = categorie,
+      Type = "Mot-cle structurel",
+      Entree = categorie,
       Explication = explication,
       `Motif detecte (regex)` = pattern,
       `Nb etablissements`,
-      `Part (%)`
+      `Part (%)`,
+      Occurrences = as.integer(NA)
     )
 
-  datatable(
-    df_exp,
-    rownames = FALSE,
-    class = "stripe hover compact",
-    options = list(pageLength = 12, scrollX = TRUE)
-  )
-})
-```
-
-### 📚 Glossaire des termes fréquents
-
-```{r p3-glossaire-termes}
-# Glossaire des acronymes/termes metier detectes dans la selection courante.
-renderDT({
-  dep <- input$dep_text
-
-  df <- if (dep == "Tous") tokens_etab else tokens_etab |> filter(dep == !!dep)
-
-  df_gloss <- df |>
+  gloss_termes <- df_tokens |>
     count(word_norm, sort = TRUE, name = "Occurrences") |>
     left_join(lexique_termes, by = "word_norm") |>
     filter(!is.na(explication)) |>
     transmute(
-      Terme = word_norm,
+      Type = "Terme metier",
+      Entree = word_norm,
       Explication = explication,
+      `Motif detecte (regex)` = as.character(NA),
+      `Nb etablissements` = as.integer(NA),
+      `Part (%)` = as.numeric(NA),
       Occurrences
     )
 
-  validate(need(nrow(df_gloss) > 0, "Aucun terme du glossaire dans cette selection."))
+  gloss_unifie <- bind_rows(gloss_struct, gloss_termes) |>
+    arrange(desc(replace_na(`Nb etablissements`, 0L)), desc(replace_na(Occurrences, 0L)), Entree)
+
+  validate(need(nrow(gloss_unifie) > 0, "Aucune entree de glossaire dans cette selection."))
 
   datatable(
-    df_gloss,
+    gloss_unifie,
     rownames = FALSE,
     class = "stripe hover compact",
-    options = list(pageLength = 12, scrollX = TRUE)
+    options = list(pageLength = 15, scrollX = TRUE)
   )
 })
 ```
