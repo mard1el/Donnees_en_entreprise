@@ -365,7 +365,11 @@ stop_metier <- tibble(
     "chez", "en", "au", "et", "ou",
     # Formes juridiques à exclure (peu informatives pour l'analyse métier)
     "sa", "sas", "sasu", "sarl", "selarl", "selas", "scp", "scm", "sci",
-    "eurl", "gie", "ei", "sea", "searl"
+    "eurl", "gie", "ei", "sea", "searl",
+    # Mots-bruit fréquents dans les raisons sociales (peu discriminants)
+    "jour", "vie", "accueil", "sociale", "domicile", "adultes", "enfants",
+    "hebergement", "nord", "sud", "paris", "val", "pays", "saint", "jean",
+    "siege", "asso", "ctre"
   )
 )
 stop_all <- bind_rows(stop_fr, stop_metier) |>
@@ -380,6 +384,11 @@ tokens_etab <- corpus_etab |>
   ) |>
   mutate(
     word_norm = normalize_text(word),
+    # Harmonisation des variantes lexicales autour de la pharmacie
+    word_norm = dplyr::case_when(
+      word_norm %in% c("pharmacies", "officine", "officines") ~ "pharmacie",
+      TRUE ~ word_norm
+    ),
     # Harmonisation : certains noms utilisent "SSAD" au lieu de "SSIAD"
     word_norm = dplyr::if_else(word_norm %in% c("ssad", "ssiad"), "ssiad", word_norm)
   ) |>
@@ -429,7 +438,11 @@ div_semantique <- tokens_etab |>
 motifs_struct <- tibble::tribble(
   ~categorie,                ~pattern,                                                              ~explication,
   "Pharmacie",              "\\bpharmacie\\b|\\bpharmacies\\b|\\bofficine\\b|\\bofficines\\b", "Officine ou structure pharmaceutique",
-  "Hopital / CH",           "\\bhopital\\b|\\bhopitaux\\b|\\bchu\\b|\\bchru\\b|\\bchr\\b",     "Hopitaux et centres hospitaliers",
+  "Hopital",                "\\bhopital\\b|\\bhopitaux\\b",                                  "Etablissements hospitaliers (terme complet)",
+  "CHRU",                   "\\bchru\\b",                                                        "Centre hospitalier regional universitaire",
+  "CHR",                    "\\bchr\\b",                                                         "Centre hospitalier regional",
+  "CHU",                    "\\bchu\\b",                                                         "Centre hospitalier universitaire",
+  "CH",                     "\\bch\\b|centre hospitalier",                                       "Centre hospitalier",
   "Clinique",               "\\bclinique\\b|\\bcliniques\\b",                                "Etablissements de type clinique",
   "SSIAD / SSAD",           "\\bssiad\\b|\\bssad\\b",                                        "Services de soins infirmiers a domicile",
   "EHPAD",                  "\\behpad\\b",                                                      "Etablissements d'hebergement pour personnes agees dependantes",
@@ -443,6 +456,42 @@ motifs_struct <- tibble::tribble(
   "MAS",                    "\\bmas\\b|maison d accueil specialisee",                            "Maison d'accueil specialisee",
   "FAM",                    "\\bfam\\b|foyer d accueil medicalise",                              "Foyer d'accueil medicalise",
   "SESSAD",                 "\\bsessad\\b",                                                     "Service d'education speciale et de soins a domicile"
+)
+
+# 8h. Glossaire des termes metier courants observes dans les noms
+lexique_termes <- tibble::tribble(
+  ~word_norm,      ~explication,
+  "pharmacie",    "Officine ou structure pharmaceutique",
+  "ehpad",        "Etablissement d'hebergement pour personnes agees dependantes",
+  "saad",         "Service d'aide et d'accompagnement a domicile",
+  "lbm",          "Laboratoire de biologie medicale",
+  "cmp",          "Centre medico-psychologique",
+  "msp",          "Maison de sante pluriprofessionnelle",
+  "ssiad",        "Service de soins infirmiers a domicile",
+  "esat",         "Etablissement et service d'aide par le travail",
+  "sessad",       "Service d'education speciale et de soins a domicile",
+  "ime",          "Institut medico-educatif",
+  "gcs",          "Groupement de cooperation sanitaire",
+  "cattp",        "Centre d'accueil therapeutique a temps partiel",
+  "savs",         "Service d'accompagnement a la vie sociale",
+  "chu",          "Centre hospitalier universitaire",
+  "chru",         "Centre hospitalier regional universitaire",
+  "chr",          "Centre hospitalier regional",
+  "ch",           "Centre hospitalier",
+  "mas",          "Maison d'accueil specialisee",
+  "cpts",         "Communaute professionnelle territoriale de sante",
+  "ccas",         "Centre communal d'action sociale",
+  "clinique",     "Etablissement de sante prive",
+  "chrs",         "Centre d'hebergement et de reinsertion sociale",
+  "hopital",      "Etablissement hospitalier",
+  "mecs",         "Maison d'enfants a caractere social",
+  "samsah",       "Service d'accompagnement medico-social pour adultes handicapes",
+  "pmi",          "Protection maternelle et infantile",
+  "eam",          "Etablissement d'accueil medicalise",
+  "medico",       "Reference au secteur medico-social",
+  "ssr",          "Soins de suite et de readaptation",
+  "had",          "Hospitalisation a domicile",
+  "admr",         "Aide a domicile en milieu rural (reseau associatif)"
 )
 
 
@@ -1245,8 +1294,15 @@ renderPlot({
   }
 
   wc_all <- filtered_tokens |>
-    count(word_norm, sort = TRUE) |>
-    slice_head(n = max(top_n, 200))
+    mutate(
+      # Regroupe les variantes lexicales dans une categorie unique visible.
+      word_cloud = dplyr::case_when(
+        word_norm %in% c("pharmacie", "pharmacies", "officine", "officines") ~ "pharmacie",
+        TRUE ~ word_norm
+      )
+    ) |>
+    count(word_cloud, sort = TRUE, name = "n") |>
+    rename(word_norm = word_cloud)
 
   wc <- wc_all |>
     slice_head(n = top_n)
@@ -1389,6 +1445,36 @@ renderDT({
 
   datatable(
     df_exp,
+    rownames = FALSE,
+    class = "stripe hover compact",
+    options = list(pageLength = 12, scrollX = TRUE)
+  )
+})
+```
+
+### 📚 Glossaire des termes fréquents
+
+```{r p3-glossaire-termes}
+# Glossaire des acronymes/termes metier detectes dans la selection courante.
+renderDT({
+  dep <- input$dep_text
+
+  df <- if (dep == "Tous") tokens_etab else tokens_etab |> filter(dep == !!dep)
+
+  df_gloss <- df |>
+    count(word_norm, sort = TRUE, name = "Occurrences") |>
+    left_join(lexique_termes, by = "word_norm") |>
+    filter(!is.na(explication)) |>
+    transmute(
+      Terme = word_norm,
+      Explication = explication,
+      Occurrences
+    )
+
+  validate(need(nrow(df_gloss) > 0, "Aucun terme du glossaire dans cette selection."))
+
+  datatable(
+    df_gloss,
     rownames = FALSE,
     class = "stripe hover compact",
     options = list(pageLength = 12, scrollX = TRUE)
