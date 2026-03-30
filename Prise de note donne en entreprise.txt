@@ -1,0 +1,7 @@
+Diagramme en barre decaler les chiffres pour qu'ils ne soient pas sur les barres
+Titre au début de la fenetre graphique pour permettre une meilleure lisibilité
+Les valeurs quand on passe les souris sur les barres, les changers pour pas avoir des noms bizzares mais des noms plus concréts
+Le Donut faire qu'il soit tjr a 100% meme quand on cache des valeurs depuis la legende
+Cartographique diviser pour 100 000 habitants
+et la heatmap soit les dissocier soit faire en sorte que les choses soit plus lisible 
+ 
